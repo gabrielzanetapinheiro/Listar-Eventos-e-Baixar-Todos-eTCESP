@@ -1,14 +1,14 @@
 // ==UserScript==
 // @name         E-TCESP - Evento + Baixar Todos
 // @namespace    http://tampermonkey.net/
-// @version      1.0
+// @version      1.1
 // @description  Exibe (ev. X.Y) antes do nome do arquivo e adiciona botão para baixar todos (sem travar a página)
 // @match        https://e-processo.tce.sp.gov.br/*
 // @noframes     true
 // @grant        none
 // @run-at       document-idle
-// @downloadURL  https://raw.githubusercontent.com/SEU_USUARIO/SEU_REPOSITORIO/main/etcesp-baixar-todos.user.js
-// @updateURL    https://raw.githubusercontent.com/SEU_USUARIO/SEU_REPOSITORIO/main/etcesp-baixar-todos.user.js
+// @downloadURL  https://raw.githubusercontent.com/gabrielzanetapinheiro/Listar-Eventos-e-Baixar-Todos-eTCESP/main/extens%C3%A3o_exibirEventos_BaixarTodos.user.js
+// @updateURL    https://raw.githubusercontent.com/gabrielzanetapinheiro/Listar-Eventos-e-Baixar-Todos-eTCESP/main/extens%C3%A3o_exibirEventos_BaixarTodos.user.js
 // ==/UserScript==
 
 (function () {
