@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         E-TCESP - Exibir Eventos + Botão Baixar Todos
 // @namespace    http://tampermonkey.net/
-// @version      1.1
+// @version      1.2
 // @description  Exibe (ev. X.Y) antes do nome do arquivo e adiciona botão para baixar todos arquivos do TC.
 // @match        https://e-processo.tce.sp.gov.br/*
 // @noframes     true
