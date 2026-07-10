@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         E-TCESP - Exibir Eventos + Botão Baixar Todos
+// @name         E-TCESP - Evento + Baixar Todos
 // @namespace    http://tampermonkey.net/
-// @version      1.3
-// @description  Exibe (ev. X.Y) antes do nome do arquivo e adiciona botão para baixar todos os arquivos do TC numa pasta com o número do processo (1ª parte com 6 dígitos, ex.: 004421.989.24-5).
+// @version      1.4
+// @description  Exibe (ev. X.Y) antes do nome do arquivo e adiciona botão para baixar todos (sem travar a página)
 // @match        https://e-processo.tce.sp.gov.br/*
 // @noframes     true
 // @grant        GM_download
@@ -15,73 +15,10 @@
 
 (function () {
     'use strict';
+    var W = (typeof unsafeWindow !== 'undefined' && unsafeWindow) ? unsafeWindow : window;
 
-    // ─────────────────────────────────────────────────────────────────────
-    // PONTE DE DOWNLOAD (roda no SANDBOX do Tampermonkey, só no frame de topo)
-    // GM_download só existe aqui — o código injetado na página (qualquer frame)
-    // manda a lista via postMessage e este bridge faz o download em subpasta.
-    // ─────────────────────────────────────────────────────────────────────
-    if (window.top === window) {
-        window.addEventListener('message', function (ev) {
-            var d = ev.data;
-            if (!d || d.__tceDL !== 1 || d.kind !== 'start') return;
-            var src = ev.source;
-            var folder = d.folder || '';
-            var files = d.files || [];
-
-            function reply(msg) {
-                try {
-                    msg.__tceDL = 1;
-                    if (src) src.postMessage(msg, '*');
-                } catch (e) {}
-            }
-
-            if (typeof GM_download !== 'function') { reply({ kind: 'error', code: 'no-gm' }); return; }
-
-            // Baixa vários arquivos ao mesmo tempo (pool de concorrência) em vez
-            // de um por um. CONCURRENCY = quantos downloads simultâneos.
-            var CONCURRENCY = Math.min(6, files.length) || 1;
-            var i = 0, done = 0, failures = 0;
-            reply({ kind: 'progress', done: 0, total: files.length, failures: 0 });
-
-            function startOne() {
-                if (i >= files.length) return;
-                var f = files[i++];
-                var name = (folder ? folder + '/' : '') + f.name;
-                var settled = false;
-                function settle(ok) {
-                    if (settled) return;
-                    settled = true;
-                    if (!ok) failures++;
-                    done++;
-                    reply({ kind: 'progress', done: done, total: files.length, failures: failures });
-                    if (done >= files.length) { reply({ kind: 'done', failures: failures, total: files.length }); return; }
-                    startOne();   // assim que um termina, dispara o próximo da fila
-                }
-                try {
-                    GM_download({
-                        url: f.url,
-                        name: name,
-                        saveAs: false,
-                        onload:    function () { settle(true); },
-                        onerror:   function () { settle(false); },
-                        ontimeout: function () { settle(false); }
-                    });
-                } catch (e) { settle(false); }
-            }
-
-            // dispara o primeiro lote; cada término puxa o próximo
-            for (var k = 0; k < CONCURRENCY; k++) startOne();
-        }, false);
-    }
-
-    // ─────────────────────────────────────────────────────────────────────
-    // CÓDIGO INJETADO NO CONTEXTO DA PÁGINA (todos os frames): máscara + botão
-    // ─────────────────────────────────────────────────────────────────────
     var scriptCode = '(' + function () {
         'use strict';
-
-        // Evita inicialização dupla na mesma janela (sobrevive à troca de body)
         if (window.__tceComboInit) return;
         window.__tceComboInit = true;
 
@@ -89,7 +26,9 @@
         var observer = null;
         var heartbeat = null;
         var lastState = '';
-        var downloading = false;   // trava o trabalho de fundo durante o "Baixar Todos"
+        var downloading = false;
+        var retryItems = null;
+        var HEARTBEAT_MS = 5000;
 
         function pauseBackground() {
             try { if (observer) observer.disconnect(); } catch (e) {}
@@ -98,11 +37,10 @@
         }
         function resumeBackground() {
             try { if (observer) observer.observe(document, { childList: true, subtree: true }); } catch (e) {}
-            if (!heartbeat) heartbeat = setInterval(run, 1500);
+            if (!heartbeat) heartbeat = setInterval(run, HEARTBEAT_MS);
         }
-
         function log(msg) {
-            try { console.log('[E-TCESP v1.4] ' + msg); } catch (e) {}
+            try { console.log('[E-TCESP v1.9] ' + msg); } catch (e) {}
         }
 
         // ── MÁSCARA DE EVENTOS ──
@@ -124,11 +62,26 @@
                 var span = document.createElement('span');
                 span.className = 'evt-num';
                 span.textContent = '(ev. ' + text + ') | ';
+                // FIX 1: força display:inline !important para não herdar o display:none
+                // que o CSS do site aplica a <span> nesse layout de processo.
                 span.style.cssText = 'font-weight:bold;color:#1a5276;font-size:12px;';
+                span.style.setProperty('display', 'inline', 'important');
                 fileLink.insertAdjacentElement('beforebegin', span);
                 added++;
             }
             return added;
+        }
+
+        // FIX 1b: rede de segurança — reforça o display em máscaras já existentes
+        // caso o site tenha reescrito o estilo depois de um re-render.
+        function enforceMaskVisibility() {
+            var masks = document.querySelectorAll('.evt-num');
+            for (var i = 0; i < masks.length; i++) {
+                if (masks[i].style.display !== 'inline') {
+                    masks[i].style.setProperty('display', 'inline', 'important');
+                }
+            }
+            return masks.length;
         }
 
         function getEvNum(linkEl) {
@@ -144,84 +97,15 @@
         }
 
         function sanitizeFileName(name) {
-            return (name || 'arquivo')
+            var clean = (name || 'arquivo')
                 .replace(/[\\/:*?"<>|\r\n\t]+/g, '-')
                 .replace(/\s+/g, ' ')
-                .trim()
-                .slice(0, 180) || 'arquivo';
-        }
-
-        // ── NÚMERO DO PROCESSO ──────────────────────────────────────────────
-        // Fonte confiável: <td class="numProcesso"><a href="...numeroProcesso=4421989245">00004421.989.24-5</a>
-        // Preferimos o canônico do href (só dígitos) e reconstruímos a máscara;
-        // se não houver, caímos no texto formatado. Buscamos no documento local
-        // e, como reserva, em todos os frames de mesma origem.
-        function collectFrames(win, out) {
-            try { out.push(win); } catch (e) { return; }
-            var n = 0;
-            try { n = win.frames.length; } catch (e) { return; }   // cross-origin
-            for (var i = 0; i < n; i++) {
-                try { collectFrames(win.frames[i], out); } catch (e) {}
-            }
-        }
-
-        function readProcAnchor(doc) {
-            try {
-                var a = doc.querySelector('td.numProcesso a, a[href*="DadosProcesso?numeroProcesso="]');
-                if (!a) return null;
-                var canon = '';
-                var m = (a.getAttribute('href') || '').match(/numeroProcesso=(\d+)/);
-                if (m) canon = m[1];
-                var text = (a.textContent || '').trim();
-                if (!canon && !/\d+\.\d{3}\.\d{2}/.test(text)) return null;
-                return { canon: canon, text: text };
-            } catch (e) { return null; }
-        }
-
-        function findProcInfo() {
-            var got = readProcAnchor(document);
-            if (got) return got;
-            var wins = [];
-            try { if (window.top) collectFrames(window.top, wins); } catch (e) {}
-            for (var i = 0; i < wins.length; i++) {
-                try {
-                    var doc = wins[i].document;
-                    if (!doc) continue;
-                    var r = readProcAnchor(doc);
-                    if (r) return r;
-                } catch (e) {}
-            }
-            return null;
-        }
-
-        // 1ª parte com 6 dígitos (tira zeros à esquerda, mantém no mínimo 6).
-        function first6(seg) {
-            var v = String(parseInt(seg, 10));
-            if (v === 'NaN') v = '0';
-            return v.length >= 6 ? v : ('000000' + v).slice(-6);
-        }
-
-        // Canônico "4421989245" = <parte1><NNN><NN><D> (últimos 6 dígitos = 989.24-5)
-        function formatFromCanon(c) {
-            if (!/^\d{7,}$/.test(c)) return null;
-            var first = c.slice(0, -6);
-            var tail  = c.slice(-6);
-            return first6(first) + '.' + tail.slice(0, 3) + '.' + tail.slice(3, 5) + '-' + tail.slice(5);
-        }
-
-        function formatFromText(t) {
-            var m = (t || '').match(/(\d+)\.(\d{3})\.(\d{2})(?:-(\d+))?/);
-            if (!m) return null;
-            return first6(m[1]) + '.' + m[2] + '.' + m[3] + (m[4] ? '-' + m[4] : '');
-        }
-
-        function getProcessFolder() {
-            var info = findProcInfo();
-            if (!info) return null;
-            var f = (info.canon && formatFromCanon(info.canon)) || formatFromText(info.text);
-            if (!f) return null;
-            // caracteres seguros p/ nome de pasta (só deve conter dígitos . e -)
-            return f.replace(/[\\/:*?"<>|\r\n\t]+/g, '-').trim();
+                .trim();
+            if (!clean) return 'arquivo';
+            if (clean.length <= 180) return clean;
+            var dot = clean.lastIndexOf('.');
+            var ext = (dot > 0 && clean.length - dot <= 12) ? clean.slice(dot) : '';
+            return (clean.slice(0, 180 - ext.length).trim() + ext) || 'arquivo';
         }
 
         function findNavLink() {
@@ -253,130 +137,154 @@
             return true;
         }
 
-        function resetBtn(btn) {
-            btn.textContent = 'Baixar Todos os Arquivos';
-            btn.style.background = '#1a5276';
+        function collectFiles() {
+            var out = [];
+            document.querySelectorAll('a[href*="DownloadArquivo"]').forEach(function (a) {
+                var name = a.textContent.trim();
+                var lower = name.toLowerCase();
+                if (lower.endsWith('.html') || lower.endsWith('.htm') || lower.endsWith('.lnk')) return;
+                var ev = getEvNum(a);
+                out.push({ url: a.href, name: sanitizeFileName(ev ? '(ev. ' + ev + ') ' + name : name) });
+            });
+            return out;
+        }
+
+        function resetButtonLater(btn, ms) {
+            setTimeout(function () {
+                if (retryItems && retryItems.length) return;
+                btn.textContent = 'Baixar Todos os Arquivos';
+                btn.style.background = '#1a5276';
+            }, ms);
+        }
+
+        function startBatch(items, btn) {
+            var batchId = 'b' + Date.now() + '_' + Math.floor(Math.random() * 1e9);
+            var noReply;
+            function cleanup() {
+                clearTimeout(noReply);
+                window.removeEventListener('message', onMsg);
+                downloading = false;
+                btn.dataset.busy = '';
+                resumeBackground();
+                // FIX 3: ao terminar o lote, reaplica imediatamente as máscaras
+                // (elas podem ter sumido se o frame re-renderizou durante o download).
+                run();
+            }
+            function onMsg(ev) {
+                var d = ev.data;
+                if (!d || d.__tce !== 1 || d.batchId !== batchId) return;
+                clearTimeout(noReply);
+                noReply = setTimeout(onNoReply, 30000);
+                if (d.type === 'progress') {
+                    btn.textContent = 'Baixando ' + d.done + '/' + d.total +
+                                      (d.failures ? ' (' + d.failures + ' falha)' : '') + '...';
+                    btn.style.background = '#78350f';
+                } else if (d.type === 'config') {
+                    cleanup();
+                    retryItems = items;
+                    alert('O Tampermonkey precisa de permissão para baixar arquivos.\n\n' +
+                          'Abra o painel da extensão Tampermonkey → Configurações →\n' +
+                          'Downloads e habilite o modo de download do navegador.\n\n' +
+                          'Depois clique novamente no botão para repetir.');
+                    btn.textContent = 'Habilite downloads no Tampermonkey e repita';
+                    btn.style.background = '#92400e';
+                    resetButtonLater(btn, 8000);
+                } else if (d.type === 'done') {
+                    cleanup();
+                    var fails = d.failures || [];
+                    retryItems = fails.length ? fails : null;
+                    if (fails.length) {
+                        log('falharam ' + fails.length + ' arquivo(s): ' +
+                            fails.map(function (f) { return f.name; }).join(' | '));
+                        btn.textContent = fails.length + ' falha(s) — clique p/ repetir';
+                        btn.style.background = '#92400e';
+                    } else {
+                        btn.textContent = 'Concluído!';
+                        btn.style.background = '#065f46';
+                        resetButtonLater(btn, 4000);
+                    }
+                }
+            }
+            function onNoReply() {
+                cleanup();
+                alert('O download não respondeu. Recarregue a página e tente de novo.\n' +
+                      '(Se persistir, confirme que o userscript está ativo nesta aba.)');
+                btn.textContent = 'Sem resposta — recarregue e repita';
+                btn.style.background = '#92400e';
+                resetButtonLater(btn, 6000);
+            }
+            window.addEventListener('message', onMsg);
+            noReply = setTimeout(onNoReply, 30000);
+            btn.textContent = 'Baixando 0/' + items.length + '...';
+            btn.style.background = '#78350f';
+            (window.top || window).postMessage({ __tceReq: 1, batchId: batchId, items: items }, '*');
         }
 
         function onDownloadClick(btn, e) {
             e.preventDefault();
             if (downloading || btn.dataset.busy === '1') return;
 
+            if (retryItems && retryItems.length) {
+                var again = retryItems;
+                retryItems = null;
+                downloading = true;
+                pauseBackground();
+                btn.dataset.busy = '1';
+                startBatch(again, btn);
+                return;
+            }
+
             downloading = true;
             pauseBackground();
 
-            // Expande os dropdowns p/ garantir que os arquivos estejam no DOM.
+            // FIX 2: guarda o estado REAL de cada dropdown (inclusive os que o
+            // usuário abriu manualmente) para restaurar exatamente como estava.
             var expanded = [];
             document.querySelectorAll('span[id^="subMostra"]').forEach(function (s) {
-                if (s.style.display !== 'block') { expanded.push(s); s.style.display = 'block'; }
+                expanded.push({ el: s, prev: s.style.display }); // salva TODOS, aberto ou fechado
+                s.style.display = 'block';
             });
             function restore() {
                 for (var i = 0; i < expanded.length; i++) {
-                    try { expanded[i].style.display = 'none'; } catch (e) {}
+                    try { expanded[i].el.style.display = expanded[i].prev; } catch (e) {}
                 }
-            }
-            function release() {
-                restore();
-                downloading = false;
-                btn.dataset.busy = '';
-                resumeBackground();
+                // FIX 2b/3: logo após recolher, reaplica as máscaras para os
+                // eventos nunca ficarem "sem número" durante/depois da coleta.
+                try { showEventNumbers(); enforceMaskVisibility(); } catch (e) {}
             }
 
             setTimeout(function () {
-                var allLinks = document.querySelectorAll('a[href*="DownloadArquivo"]');
-                var toDownload = [];
-                allLinks.forEach(function (a) {
-                    var name = a.textContent.trim();
-                    var lower = name.toLowerCase();
-                    if (lower.endsWith('.html') || lower.endsWith('.htm') || lower.endsWith('.lnk')) return;
-                    var ev = getEvNum(a);
-                    toDownload.push({ url: a.href, name: sanitizeFileName(ev ? '(ev. ' + ev + ') ' + name : name) });
-                });
-
-                restore(); // URLs já capturadas — não precisamos mais dos dropdowns abertos
-
-                if (!toDownload.length) { alert('Nenhum arquivo encontrado.'); release(); return; }
-
-                var folder = getProcessFolder();
-
-                var msg = 'Baixar ' + toDownload.length + ' arquivo(s)?\n' +
-                          '(Arquivos .html e .lnk serão ignorados)\n\n' +
-                          (folder
-                              ? ('Pasta de destino (dentro de Downloads):\n    ' + folder + '\n')
-                              : ('⚠ Não consegui detectar o número do processo — os arquivos irão\n' +
-                                 'direto para a raiz da pasta Downloads.\n')) +
-                          '\nDica: em chrome://settings/downloads DESATIVE\n' +
-                          '"Perguntar onde salvar cada arquivo antes de baixar".';
-                if (!confirm(msg)) { release(); return; }
-
+                var items = collectFiles();
+                restore();
+                if (!items.length) {
+                    downloading = false; resumeBackground();
+                    alert('Nenhum arquivo encontrado.');
+                    return;
+                }
+                var msg = 'Baixar ' + items.length + ' arquivo(s)?\n' +
+                          '(Arquivos .html e .lnk são ignorados)\n\n' +
+                          'O Tampermonkey salva direto na sua pasta de Downloads —\n' +
+                          'não é preciso mexer nas configurações do Chrome.';
+                if (!confirm(msg)) {
+                    downloading = false; resumeBackground();
+                    run(); // reaplica máscaras após o cancelamento
+                    return;
+                }
                 btn.dataset.busy = '1';
-                btn.textContent = 'Enviando...';
-                btn.style.background = '#78350f';
-
-                var guard = null;
-                function armGuard(ms) {
-                    if (guard) clearTimeout(guard);
-                    guard = setTimeout(function () { finishUI(0, toDownload.length, 'timeout'); }, ms);
-                }
-                function finishUI(failures, total, how) {
-                    if (guard) { clearTimeout(guard); guard = null; }
-                    window.removeEventListener('message', onMsg);
-                    release();
-                    if (how === 'timeout') {
-                        btn.textContent = 'Sem resposta — confira GM_download';
-                        btn.style.background = '#92400e';
-                    } else if (how === 'no-gm') {
-                        btn.textContent = 'Habilite GM_download';
-                        btn.style.background = '#92400e';
-                        alert('GM_download não está disponível.\n\n' +
-                              'No cabeçalho da extensão deve constar "@grant GM_download".\n' +
-                              'Além disso, no Tampermonkey (Configurações → Downloads) habilite\n' +
-                              'o modo de download do navegador e as subpastas, e libere as\n' +
-                              'extensões de arquivo (ou use *). Depois recarregue a página.');
-                    } else {
-                        btn.textContent = failures ? ('Concluído — ' + failures + ' falha(s)') : 'Concluído!';
-                        btn.style.background = failures ? '#92400e' : '#065f46';
-                    }
-                    setTimeout(function () { resetBtn(btn); }, 5000);
-                }
-
-                function onMsg(ev2) {
-                    var d = ev2.data;
-                    if (!d || d.__tceDL !== 1) return;
-                    if (d.kind === 'progress') {
-                        armGuard(60000);
-                        if (d.done < d.total) {
-                            btn.textContent = 'Baixando ' + d.done + '/' + d.total + '...';
-                            btn.style.background = '#78350f';
-                        }
-                    } else if (d.kind === 'done') {
-                        finishUI(d.failures || 0, d.total || toDownload.length, 'ok');
-                    } else if (d.kind === 'error') {
-                        finishUI(0, toDownload.length, d.code === 'no-gm' ? 'no-gm' : 'timeout');
-                    }
-                }
-
-                window.addEventListener('message', onMsg, false);
-                armGuard(15000); // se o bridge nem responder o 1º progress
-
-                try {
-                    (window.top || window).postMessage(
-                        { __tceDL: 1, kind: 'start', folder: folder, files: toDownload }, '*');
-                } catch (err) {
-                    window.removeEventListener('message', onMsg);
-                    release();
-                    alert('Falha ao acionar o download: ' + (err && err.message));
-                    resetBtn(btn);
-                    btn.dataset.busy = '';
-                }
-            }, 400);
+                startBatch(items, btn);
+            }, 600);
         }
 
         // ── EXECUÇÃO IDEMPOTENTE ──
         function run() {
-            if (downloading) return;
             try {
+                // FIX 3: mesmo durante o download, mantém as máscaras aplicadas e
+                // visíveis (só evita mexer nos dropdowns). Antes o "return" deixava
+                // os eventos sem número por todo o lote.
                 var addedMasks = showEventNumbers();
+                enforceMaskVisibility();
+                if (downloading) return;
+
                 var addedBtn = addDownloadButton();
                 var masks = document.querySelectorAll('.evt-num').length;
                 var hasBtn = !!document.getElementById('tce-dl-btn');
@@ -403,13 +311,12 @@
 
         [300, 900, 2000].forEach(function (t) { setTimeout(run, t); });
 
-        heartbeat = setInterval(run, 1500);
+        heartbeat = setInterval(run, HEARTBEAT_MS);
 
         window.addEventListener('pagehide', function () {
             try { observer.disconnect(); } catch (e) {}
             try { clearInterval(heartbeat); } catch (e) {}
         }, { once: true });
-
     } + ')();';
 
     function injectIntoFrame(win) {
@@ -429,14 +336,121 @@
         if (!win || depth > 6) return;
         injectIntoFrame(win);
         var n = 0;
-        try { n = win.frames.length; } catch (e) { return; } // cross-origin
+        try { n = win.frames.length; } catch (e) { return; }
         for (var i = 0; i < n; i++) {
             try { scanWin(win.frames[i], depth + 1); } catch (e) {}
         }
     }
+    function scan() { scanWin(W, 0); }
 
-    function scan() { scanWin(window, 0); }
+    // ── HOST DE DOWNLOAD ──
+    var DL_TIMEOUT = 120000;
+    var CONFIG_ERRORS = { not_enabled: 1, not_whitelisted: 1, not_permitted: 1, not_supported: 1 };
+    var TRANSIENT = { timeout: 1, network: 1, server_error: 1 };
 
+    function runDownloadBatch(items, source, batchId) {
+        var pending = items.map(function (it) { return { url: it.url, name: it.name, tries: 0 }; });
+        var total = pending.length;
+        var done = 0, inFlight = 0;
+        var failures = [];
+        var concurrency = 2, okStreak = 0, failStreak = 0;
+        var launchGap = 200, lastLaunch = 0;
+        var finished = false;
+
+        function reply(msg) {
+            msg.__tce = 1; msg.batchId = batchId;
+            try { source.postMessage(msg, '*'); } catch (e) {}
+        }
+        function slowDown() {
+            failStreak++;
+            if (failStreak >= 2) { concurrency = 1; launchGap = Math.min(3000, launchGap * 2); failStreak = 0; }
+        }
+        function settle(item, ok, kind) {
+            inFlight--;
+            if (ok) {
+                done++; okStreak++; failStreak = 0;
+                if (okStreak >= 5 && concurrency < 3) { concurrency++; okStreak = 0; launchGap = Math.max(150, launchGap - 50); }
+            } else if (TRANSIENT[kind] && item.tries < 3) {
+                item.tries++; okStreak = 0; slowDown();
+                setTimeout(function () { pending.push(item); pump(); }, item.tries === 1 ? 2000 : 8000);
+            } else {
+                done++; okStreak = 0; slowDown();
+                failures.push({ url: item.url, name: item.name });
+            }
+            reply({ type: 'progress', done: done, total: total, failures: failures.length });
+            pump();
+        }
+        function launch(item) {
+            inFlight++;
+            var settled = false, handle;
+            function fin(ok, kind) {
+                if (settled) return; settled = true;
+                clearTimeout(watchdog);
+                if (!ok && CONFIG_ERRORS[kind]) {
+                    if (!finished) { finished = true; reply({ type: 'config' }); }
+                    return;
+                }
+                settle(item, ok, kind);
+            }
+            var watchdog = setTimeout(function () {
+                try { if (handle && handle.abort) handle.abort(); } catch (e) {}
+                fin(false, 'timeout');
+            }, DL_TIMEOUT + 5000);
+            try {
+                handle = GM_download({
+                    url: item.url,
+                    name: item.name,
+                    saveAs: false,
+                    timeout: DL_TIMEOUT,
+                    onload: function () { fin(true); },
+                    ontimeout: function () { fin(false, 'timeout'); },
+                    onerror: function (err) { fin(false, (err && err.error) || 'network'); }
+                });
+            } catch (e) {
+                fin(false, 'fatal');
+            }
+        }
+        function pump() {
+            if (finished) return;
+            if (done >= total && inFlight === 0 && pending.length === 0) {
+                finished = true;
+                reply({ type: 'done', total: total, failures: failures });
+                return;
+            }
+            while (inFlight < concurrency && pending.length) {
+                var wait = launchGap - (Date.now() - lastLaunch);
+                if (wait > 0) { setTimeout(pump, wait); return; }
+                lastLaunch = Date.now();
+                launch(pending.shift());
+            }
+        }
+        var heartbeat = setInterval(function () {
+            if (finished) { clearInterval(heartbeat); return; }
+            reply({ type: 'ping' });
+        }, 10000);
+        reply({ type: 'progress', done: 0, total: total, failures: 0 });
+        pump();
+    }
+
+    function onHostMessage(ev) {
+        if (ev.origin !== location.origin) return;
+        var d = ev.data;
+        if (!d || d.__tceReq !== 1 || !d.batchId || !Array.isArray(d.items) || !d.items.length) return;
+        if (typeof GM_download !== 'function') {
+            try { ev.source.postMessage({ __tce: 1, batchId: d.batchId, type: 'config' }, '*'); } catch (e) {}
+            return;
+        }
+        var items = [];
+        for (var i = 0; i < d.items.length; i++) {
+            var it = d.items[i];
+            if (!it || typeof it.url !== 'string' || typeof it.name !== 'string') continue;
+            if (it.url.indexOf(location.origin + '/') !== 0) continue;
+            items.push({ url: it.url, name: it.name });
+        }
+        if (items.length) runDownloadBatch(items, ev.source, d.batchId);
+    }
+
+    W.addEventListener('message', onHostMessage);
     scan();
     setInterval(scan, 3000);
 })();
