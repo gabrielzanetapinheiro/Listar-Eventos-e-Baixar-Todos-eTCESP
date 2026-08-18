@@ -1,8 +1,9 @@
 // ==UserScript==
 // @name         E-TCESP - Evento + Baixar Todos
 // @namespace    http://tampermonkey.net/
-// @version      1.4
+// @version      1.5
 // @description  Exibe (ev. X.Y) antes do nome do arquivo e adiciona botão para baixar todos (sem travar a página)
+// @author       Gabriel Zaneta Pinheiro
 // @match        https://e-processo.tce.sp.gov.br/*
 // @noframes     true
 // @grant        GM_download
@@ -177,7 +178,8 @@
                 noReply = setTimeout(onNoReply, 30000);
                 if (d.type === 'progress') {
                     btn.textContent = 'Baixando ' + d.done + '/' + d.total +
-                                      (d.failures ? ' (' + d.failures + ' falha)' : '') + '...';
+                                      (d.failures ? ' (' + d.failures + ' falha)' : '') +
+                                      (d.limitado ? ' [ritmo reduzido]' : '') + '...';
                     btn.style.background = '#78350f';
                 } else if (d.type === 'config') {
                     cleanup();
@@ -348,40 +350,69 @@
     var CONFIG_ERRORS = { not_enabled: 1, not_whitelisted: 1, not_permitted: 1, not_supported: 1 };
     var TRANSIENT = { timeout: 1, network: 1, server_error: 1 };
 
+    /* Estratégia de ritmo: dispara TODOS os arquivos de uma vez e deixa o
+       navegador/servidor ditarem o limite real. Só quando aparece falha de rede
+       (timeout, conexão caída, 5xx) o lote entra em modo limitado — poucos
+       downloads simultâneos e intervalo entre disparos —, apertando mais a cada
+       nova falha. O modo limitado não volta atrás: uma vez que o servidor deu
+       sinal de saturação, o resto do lote termina no ritmo seguro. */
+    var CONCORRENCIA_LIMITADA = 3;
+    var GAP_LIMITADO_MS = 200;
+    var GAP_LIMITADO_MAX_MS = 3000;
+
     function runDownloadBatch(items, source, batchId) {
         var pending = items.map(function (it) { return { url: it.url, name: it.name, tries: 0 }; });
         var total = pending.length;
         var done = 0, inFlight = 0;
         var failures = [];
-        var concurrency = 2, okStreak = 0, failStreak = 0;
-        var launchGap = 200, lastLaunch = 0;
+        var concurrency = total;            /* tudo de uma vez */
+        var launchGap = 0, lastLaunch = 0;
+        var limitado = false;
         var finished = false;
 
         function reply(msg) {
             msg.__tce = 1; msg.batchId = batchId;
             try { source.postMessage(msg, '*'); } catch (e) {}
         }
-        function slowDown() {
-            failStreak++;
-            if (failStreak >= 2) { concurrency = 1; launchGap = Math.min(3000, launchGap * 2); failStreak = 0; }
+        function reportarProgresso() {
+            reply({ type: 'progress', done: done, total: total, failures: failures.length, limitado: limitado });
+        }
+        function limitar(motivo) {
+            if (!limitado) {
+                limitado = true;
+                concurrency = Math.min(CONCORRENCIA_LIMITADA, total);
+                launchGap = GAP_LIMITADO_MS;
+            } else {
+                concurrency = Math.max(1, concurrency - 1);
+                launchGap = Math.min(GAP_LIMITADO_MAX_MS, launchGap * 2);
+            }
+            try {
+                console.log('[E-TCESP] rede reclamou (' + motivo + ') — limitando para ' +
+                            concurrency + ' download(s) simultâneo(s), intervalo ' + launchGap + 'ms');
+            } catch (e) {}
         }
         function settle(item, ok, kind) {
             inFlight--;
             if (ok) {
-                done++; okStreak++; failStreak = 0;
-                if (okStreak >= 5 && concurrency < 3) { concurrency++; okStreak = 0; launchGap = Math.max(150, launchGap - 50); }
+                done++;
             } else if (TRANSIENT[kind] && item.tries < 3) {
-                item.tries++; okStreak = 0; slowDown();
+                item.tries++;
+                limitar(kind);
                 setTimeout(function () { pending.push(item); pump(); }, item.tries === 1 ? 2000 : 8000);
             } else {
-                done++; okStreak = 0; slowDown();
+                done++;
+                if (TRANSIENT[kind]) limitar(kind);
                 failures.push({ url: item.url, name: item.name });
             }
-            reply({ type: 'progress', done: done, total: total, failures: failures.length });
+            reportarProgresso();
             pump();
         }
         function launch(item) {
             inFlight++;
+            /* Com muitos downloads disparados juntos, o navegador enfileira: o
+               arquivo pode ficar minutos só esperando a vez. O prazo acompanha a
+               fila para não marcar como "timeout" quem nem começou a baixar. */
+            var prazo = DL_TIMEOUT + Math.min(600000, inFlight * 2000);
             var settled = false, handle;
             function fin(ok, kind) {
                 if (settled) return; settled = true;
@@ -395,13 +426,13 @@
             var watchdog = setTimeout(function () {
                 try { if (handle && handle.abort) handle.abort(); } catch (e) {}
                 fin(false, 'timeout');
-            }, DL_TIMEOUT + 5000);
+            }, prazo + 5000);
             try {
                 handle = GM_download({
                     url: item.url,
                     name: item.name,
                     saveAs: false,
-                    timeout: DL_TIMEOUT,
+                    timeout: prazo,
                     onload: function () { fin(true); },
                     ontimeout: function () { fin(false, 'timeout'); },
                     onerror: function (err) { fin(false, (err && err.error) || 'network'); }
@@ -428,7 +459,7 @@
             if (finished) { clearInterval(heartbeat); return; }
             reply({ type: 'ping' });
         }, 10000);
-        reply({ type: 'progress', done: 0, total: total, failures: 0 });
+        reportarProgresso();
         pump();
     }
 
