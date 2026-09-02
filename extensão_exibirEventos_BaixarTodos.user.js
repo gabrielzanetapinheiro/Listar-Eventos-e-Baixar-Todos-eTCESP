@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         E-TCESP - Evento + Baixar Todos
 // @namespace    http://tampermonkey.net/
-// @version      1.5
-// @description  Exibe (ev. X.Y) antes do nome do arquivo e adiciona botão para baixar todos (sem travar a página)
+// @version      1.6
+// @description  Exibe (ev. X.Y) antes do nome do arquivo e adiciona botão para baixar todos numa pasta com o número do processo (sem travar a página)
 // @author       Gabriel Zaneta Pinheiro
 // @match        https://e-processo.tce.sp.gov.br/*
 // @noframes     true
@@ -41,7 +41,7 @@
             if (!heartbeat) heartbeat = setInterval(run, HEARTBEAT_MS);
         }
         function log(msg) {
-            try { console.log('[E-TCESP v1.9] ' + msg); } catch (e) {}
+            try { console.log('[E-TCESP v1.6] ' + msg); } catch (e) {}
         }
 
         // ── MÁSCARA DE EVENTOS ──
@@ -107,6 +107,80 @@
             var dot = clean.lastIndexOf('.');
             var ext = (dot > 0 && clean.length - dot <= 12) ? clean.slice(dot) : '';
             return (clean.slice(0, 180 - ext.length).trim() + ext) || 'arquivo';
+        }
+
+        // ── NÚMERO DO PROCESSO (pasta de destino) ───────────────────────────
+        // Fonte confiável: <td class="numProcesso"><a href="...numeroProcesso=4421989245">00004421.989.24-5</a>
+        // Preferimos o canônico do href (só dígitos) e reconstruímos a máscara;
+        // se não houver, caímos no texto formatado. Buscamos no documento local
+        // e, como reserva, em todos os frames de mesma origem.
+        function collectFrames(win, out) {
+            try { out.push(win); } catch (e) { return; }
+            var n = 0;
+            try { n = win.frames.length; } catch (e) { return; }   // cross-origin
+            for (var i = 0; i < n; i++) {
+                try { collectFrames(win.frames[i], out); } catch (e) {}
+            }
+        }
+
+        function readProcAnchor(doc) {
+            try {
+                var a = doc.querySelector('td.numProcesso a, a[href*="DadosProcesso?numeroProcesso="]');
+                if (!a) return null;
+                var canon = '';
+                var m = (a.getAttribute('href') || '').match(/numeroProcesso=(\d+)/);
+                if (m) canon = m[1];
+                var text = (a.textContent || '').trim();
+                if (!canon && !/\d+\.\d{3}\.\d{2}/.test(text)) return null;
+                return { canon: canon, text: text };
+            } catch (e) { return null; }
+        }
+
+        function findProcInfo() {
+            var got = readProcAnchor(document);
+            if (got) return got;
+            var wins = [];
+            try { if (window.top) collectFrames(window.top, wins); } catch (e) {}
+            for (var i = 0; i < wins.length; i++) {
+                try {
+                    var doc = wins[i].document;
+                    if (!doc) continue;
+                    var r = readProcAnchor(doc);
+                    if (r) return r;
+                } catch (e) {}
+            }
+            return null;
+        }
+
+        // 1ª parte com 6 dígitos (tira zeros à esquerda, mantém no mínimo 6).
+        function first6(seg) {
+            var v = String(parseInt(seg, 10));
+            if (v === 'NaN') v = '0';
+            return v.length >= 6 ? v : ('000000' + v).slice(-6);
+        }
+
+        // Canônico "4421989245" = <parte1><NNN><NN><D> (últimos 6 dígitos = 989.24-5)
+        function formatFromCanon(c) {
+            if (!/^\d{7,}$/.test(c)) return null;
+            var first = c.slice(0, -6);
+            var tail  = c.slice(-6);
+            return first6(first) + '.' + tail.slice(0, 3) + '.' + tail.slice(3, 5) + '-' + tail.slice(5);
+        }
+
+        function formatFromText(t) {
+            var m = (t || '').match(/(\d+)\.(\d{3})\.(\d{2})(?:-(\d+))?/);
+            if (!m) return null;
+            return first6(m[1]) + '.' + m[2] + '.' + m[3] + (m[4] ? '-' + m[4] : '');
+        }
+
+        // Subpasta dentro de Downloads (ex.: "004421.989.24-5"), ou null quando o
+        // número do processo não aparece na página — aí o lote vai para a raiz.
+        // O host só aceita pasta nesse formato, então o que não bater vira null.
+        function getProcessFolder() {
+            var info = findProcInfo();
+            if (!info) return null;
+            var f = (info.canon && formatFromCanon(info.canon)) || formatFromText(info.text);
+            return (f && /^\d[\d.\-]*$/.test(f)) ? f : null;
         }
 
         function findNavLink() {
@@ -186,7 +260,9 @@
                     retryItems = items;
                     alert('O Tampermonkey precisa de permissão para baixar arquivos.\n\n' +
                           'Abra o painel da extensão Tampermonkey → Configurações →\n' +
-                          'Downloads e habilite o modo de download do navegador.\n\n' +
+                          'Downloads e habilite o modo de download do navegador.\n' +
+                          'Para salvar na pasta do processo, habilite também as\n' +
+                          'subpastas ("Subdirectory"/"Subdiretório").\n\n' +
                           'Depois clique novamente no botão para repetir.');
                     btn.textContent = 'Habilite downloads no Tampermonkey e repita';
                     btn.style.background = '#92400e';
@@ -219,7 +295,10 @@
             noReply = setTimeout(onNoReply, 30000);
             btn.textContent = 'Baixando 0/' + items.length + '...';
             btn.style.background = '#78350f';
-            (window.top || window).postMessage({ __tceReq: 1, batchId: batchId, items: items }, '*');
+            // A pasta é recalculada a cada envio (inclusive na repetição das
+            // falhas) e viaja separada dos nomes — quem prefixa é o host.
+            (window.top || window).postMessage(
+                { __tceReq: 1, batchId: batchId, folder: getProcessFolder() || '', items: items }, '*');
         }
 
         function onDownloadClick(btn, e) {
@@ -263,10 +342,13 @@
                     alert('Nenhum arquivo encontrado.');
                     return;
                 }
+                var folder = getProcessFolder();
                 var msg = 'Baixar ' + items.length + ' arquivo(s)?\n' +
                           '(Arquivos .html e .lnk são ignorados)\n\n' +
-                          'O Tampermonkey salva direto na sua pasta de Downloads —\n' +
-                          'não é preciso mexer nas configurações do Chrome.';
+                          (folder
+                              ? 'Pasta de destino (dentro de Downloads):\n    ' + folder
+                              : 'Número do processo não encontrado — os arquivos vão\n' +
+                                'direto para a raiz da pasta Downloads.');
                 if (!confirm(msg)) {
                     downloading = false; resumeBackground();
                     run(); // reaplica máscaras após o cancelamento
@@ -360,7 +442,11 @@
     var GAP_LIMITADO_MS = 200;
     var GAP_LIMITADO_MAX_MS = 3000;
 
-    function runDownloadBatch(items, source, batchId) {
+    function runDownloadBatch(items, source, batchId, folder) {
+        /* Prefixo da subpasta aplicado só na hora do GM_download: assim item.name
+           continua sendo o nome puro do arquivo no progresso, nas falhas devolvidas
+           à página e na repetição do lote (que reenvia a pasta por conta própria). */
+        var prefix = folder ? folder + '/' : '';
         var pending = items.map(function (it) { return { url: it.url, name: it.name, tries: 0 }; });
         var total = pending.length;
         var done = 0, inFlight = 0;
@@ -430,7 +516,7 @@
             try {
                 handle = GM_download({
                     url: item.url,
-                    name: item.name,
+                    name: prefix + item.name,
                     saveAs: false,
                     timeout: prazo,
                     onload: function () { fin(true); },
@@ -471,6 +557,10 @@
             try { ev.source.postMessage({ __tce: 1, batchId: d.batchId, type: 'config' }, '*'); } catch (e) {}
             return;
         }
+        // Só aceita pasta no formato do número do processo (dígitos, ponto e
+        // hífen, começando por dígito): nada de barra, logo nada de sair da
+        // pasta de Downloads. Qualquer outra coisa cai na raiz.
+        var folder = (typeof d.folder === 'string' && /^\d[\d.\-]{0,59}$/.test(d.folder)) ? d.folder : '';
         var items = [];
         for (var i = 0; i < d.items.length; i++) {
             var it = d.items[i];
@@ -478,7 +568,7 @@
             if (it.url.indexOf(location.origin + '/') !== 0) continue;
             items.push({ url: it.url, name: it.name });
         }
-        if (items.length) runDownloadBatch(items, ev.source, d.batchId);
+        if (items.length) runDownloadBatch(items, ev.source, d.batchId, folder);
     }
 
     W.addEventListener('message', onHostMessage);

@@ -5,7 +5,7 @@ Resolve duas dores do dia a dia da fiscalização: descobrir a qual evento perte
 baixar o processo inteiro sem clicar arquivo por arquivo.
 
 **Autor:** Gabriel Zaneta Pinheiro — Estagiário UR-02
-**Versão atual:** 1.5
+**Versão atual:** 1.6
 
 ---
 
@@ -32,6 +32,8 @@ Um botão azul é inserido ao lado do link **"Navegar Pelo Processo"**. Ao clica
   voltam exatamente ao estado em que estavam;
 - é exibida uma confirmação com a quantidade de arquivos encontrados;
 - cada arquivo é salvo já nomeado como `(ev. X.Y) Nome do arquivo.pdf`;
+- o lote inteiro vai para uma pasta com o número do processo dentro de **Downloads**
+  (ex.: `Downloads/004421.989.24-5/`) — exige o **Passo 5**;
 - arquivos `.html`, `.htm` e `.lnk` (atalhos e páginas de apoio do sistema) são ignorados;
 - o botão mostra o progresso em tempo real: `Baixando 37/120...`.
 
@@ -112,6 +114,19 @@ Se o aviso já tiver sido bloqueado antes, é possível corrigir:
 O caminho equivalente pelas configurações do Chrome é
 `chrome://settings/content/automaticDownloads`.
 
+### Passo 5 — Habilitar as subpastas no Tampermonkey
+
+Para que o lote seja salvo na pasta com o número do processo, o Tampermonkey precisa ter permissão
+de gravar em subpastas de **Downloads**:
+
+1. Clique no ícone do Tampermonkey → **Painel de controle**.
+2. Aba **Configurações** (mude o "Modo de configuração" para **Avançado**, se necessário).
+3. Na seção **Downloads**, habilite o **modo de download do navegador**.
+4. Ainda ali, permita as **subpastas** (*Subdirectory* / *Subdiretório*).
+
+Sem isso, o Tampermonkey recusa o lote e o botão mostra
+`Habilite downloads no Tampermonkey e repita`.
+
 ---
 
 ## Solução de problemas
@@ -120,13 +135,15 @@ O caminho equivalente pelas configurações do Chrome é
 |---|---|
 | Nada aparece na página (sem número de evento e sem botão) | Confirme o **Passo 2** — "Permitir scripts de usuário" ativado no Tampermonkey. |
 | Só o primeiro arquivo é baixado | Downloads múltiplos bloqueados — veja o **Passo 4**. |
-| Botão diz *"Habilite downloads no Tampermonkey e repita"* | Painel do Tampermonkey → **Configurações** → **Downloads** → habilite o modo de download do navegador. Depois clique no botão de novo. |
+| Botão diz *"Habilite downloads no Tampermonkey e repita"* | Painel do Tampermonkey → **Configurações** → **Downloads** → habilite o modo de download do navegador **e as subpastas** (veja o **Passo 5**). Depois clique no botão de novo. |
+| Os arquivos caíram soltos na raiz de Downloads | O número do processo não foi encontrado na tela. Confirme que está na página do processo (com o número visível no topo) e não em outra aba do sistema. |
 | Botão diz *"Sem resposta — recarregue e repita"* | Recarregue a página do processo e tente novamente. |
 | Alguns arquivos falharam | Clique no botão outra vez: ele repete **apenas** os que falharam. |
 | *"Nenhum arquivo encontrado"* | Verifique se você está na tela de listagem de arquivos do processo, e não em outra aba do sistema. |
 
-Os arquivos vão para a pasta padrão de **Downloads** do navegador. Não é necessário mexer em mais
-nada nas configurações do Chrome além do que está descrito acima.
+Os arquivos vão para uma pasta com o número do processo dentro da pasta padrão de **Downloads** do
+navegador. Quando o número do processo não é encontrado na tela, o lote cai na raiz de Downloads —
+a confirmação exibida antes do download sempre informa qual será o destino.
 
 ---
 
