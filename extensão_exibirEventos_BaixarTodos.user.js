@@ -1,14 +1,18 @@
 // ==UserScript==
 // @name         E-TCESP - Evento + Baixar Todos
 // @namespace    http://tampermonkey.net/
-// @version      1.6
-// @description  Exibe (ev. X.Y) antes do nome do arquivo e adiciona botão para baixar todos numa pasta com o número do processo (sem travar a página)
+// @version      1.7
+// @description  Exibe (ev. X.Y) antes do nome do arquivo e adiciona botão para baixar todos numa pasta com o número do processo. Despachos (.html) e publicações (.lnk) são salvos com o CONTEÚDO, não com o link.
 // @author       Gabriel Zaneta Pinheiro
 // @match        https://e-processo.tce.sp.gov.br/*
 // @noframes     true
 // @grant        GM_download
+// @grant        GM_xmlhttpRequest
 // @connect      e-processo.tce.sp.gov.br
+// @connect      do.tce.sp.gov.br
+// @connect      tce.sp.gov.br
 // @connect      self
+// @connect      *
 // @run-at       document-idle
 // @downloadURL  https://raw.githubusercontent.com/gabrielzanetapinheiro/Listar-Eventos-e-Baixar-Todos-eTCESP/main/extens%C3%A3o_exibirEventos_BaixarTodos.user.js
 // @updateURL    https://raw.githubusercontent.com/gabrielzanetapinheiro/Listar-Eventos-e-Baixar-Todos-eTCESP/main/extens%C3%A3o_exibirEventos_BaixarTodos.user.js
@@ -41,7 +45,7 @@
             if (!heartbeat) heartbeat = setInterval(run, HEARTBEAT_MS);
         }
         function log(msg) {
-            try { console.log('[E-TCESP v1.6] ' + msg); } catch (e) {}
+            try { console.log('[E-TCESP v1.7] ' + msg); } catch (e) {}
         }
 
         // ── MÁSCARA DE EVENTOS ──
@@ -63,8 +67,6 @@
                 var span = document.createElement('span');
                 span.className = 'evt-num';
                 span.textContent = '(ev. ' + text + ') | ';
-                // FIX 1: força display:inline !important para não herdar o display:none
-                // que o CSS do site aplica a <span> nesse layout de processo.
                 span.style.cssText = 'font-weight:bold;color:#1a5276;font-size:12px;';
                 span.style.setProperty('display', 'inline', 'important');
                 fileLink.insertAdjacentElement('beforebegin', span);
@@ -73,8 +75,6 @@
             return added;
         }
 
-        // FIX 1b: rede de segurança — reforça o display em máscaras já existentes
-        // caso o site tenha reescrito o estilo depois de um re-render.
         function enforceMaskVisibility() {
             var masks = document.querySelectorAll('.evt-num');
             for (var i = 0; i < masks.length; i++) {
@@ -109,15 +109,11 @@
             return (clean.slice(0, 180 - ext.length).trim() + ext) || 'arquivo';
         }
 
-        // ── NÚMERO DO PROCESSO (pasta de destino) ───────────────────────────
-        // Fonte confiável: <td class="numProcesso"><a href="...numeroProcesso=4421989245">00004421.989.24-5</a>
-        // Preferimos o canônico do href (só dígitos) e reconstruímos a máscara;
-        // se não houver, caímos no texto formatado. Buscamos no documento local
-        // e, como reserva, em todos os frames de mesma origem.
+        // ── NÚMERO DO PROCESSO (pasta de destino) ──
         function collectFrames(win, out) {
             try { out.push(win); } catch (e) { return; }
             var n = 0;
-            try { n = win.frames.length; } catch (e) { return; }   // cross-origin
+            try { n = win.frames.length; } catch (e) { return; }
             for (var i = 0; i < n; i++) {
                 try { collectFrames(win.frames[i], out); } catch (e) {}
             }
@@ -152,14 +148,12 @@
             return null;
         }
 
-        // 1ª parte com 6 dígitos (tira zeros à esquerda, mantém no mínimo 6).
         function first6(seg) {
             var v = String(parseInt(seg, 10));
             if (v === 'NaN') v = '0';
             return v.length >= 6 ? v : ('000000' + v).slice(-6);
         }
 
-        // Canônico "4421989245" = <parte1><NNN><NN><D> (últimos 6 dígitos = 989.24-5)
         function formatFromCanon(c) {
             if (!/^\d{7,}$/.test(c)) return null;
             var first = c.slice(0, -6);
@@ -173,9 +167,6 @@
             return first6(m[1]) + '.' + m[2] + '.' + m[3] + (m[4] ? '-' + m[4] : '');
         }
 
-        // Subpasta dentro de Downloads (ex.: "004421.989.24-5"), ou null quando o
-        // número do processo não aparece na página — aí o lote vai para a raiz.
-        // O host só aceita pasta nesse formato, então o que não bater vira null.
         function getProcessFolder() {
             var info = findProcInfo();
             if (!info) return null;
@@ -212,14 +203,31 @@
             return true;
         }
 
+        // NOVO (v1.7): nada é mais ignorado. PDF é baixado direto; todo o resto
+        // (despachos .html, publicações .lnk etc.) é marcado como "extract": o
+        // host busca o conteúdo real (seguindo redirecionamentos) e salva o
+        // documento em si, não o atalho.
         function collectFiles() {
             var out = [];
+            var seen = {};
             document.querySelectorAll('a[href*="DownloadArquivo"]').forEach(function (a) {
                 var name = a.textContent.trim();
                 var lower = name.toLowerCase();
-                if (lower.endsWith('.html') || lower.endsWith('.htm') || lower.endsWith('.lnk')) return;
+                var kind = /\.pdf$/.test(lower) ? 'direct' : 'extract';
                 var ev = getEvNum(a);
-                out.push({ url: a.href, name: sanitizeFileName(ev ? '(ev. ' + ev + ') ' + name : name) });
+                var finalName = sanitizeFileName(ev ? '(ev. ' + ev + ') ' + name : name);
+                // evita nomes repetidos (ex.: vários "online.html" no mesmo evento)
+                var key = finalName.toLowerCase();
+                if (seen[key]) {
+                    seen[key]++;
+                    var dot = finalName.lastIndexOf('.');
+                    finalName = dot > 0
+                        ? finalName.slice(0, dot) + ' (' + seen[key] + ')' + finalName.slice(dot)
+                        : finalName + ' (' + seen[key] + ')';
+                } else {
+                    seen[key] = 1;
+                }
+                out.push({ url: a.href, name: finalName, kind: kind });
             });
             return out;
         }
@@ -241,8 +249,6 @@
                 downloading = false;
                 btn.dataset.busy = '';
                 resumeBackground();
-                // FIX 3: ao terminar o lote, reaplica imediatamente as máscaras
-                // (elas podem ter sumido se o frame re-renderizou durante o download).
                 run();
             }
             function onMsg(ev) {
@@ -270,7 +276,15 @@
                 } else if (d.type === 'done') {
                     cleanup();
                     var fails = d.failures || [];
+                    var soltos = d.fallbacks || [];
                     retryItems = fails.length ? fails : null;
+                    if (soltos.length) {
+                        log(soltos.length + ' documento(s) salvos na raiz de Downloads (fora da pasta): ' + soltos.join(' | '));
+                        alert(soltos.length + ' documento(s) .html foram salvos direto na pasta Downloads,\n' +
+                              'fora da subpasta do processo, porque o Tampermonkey recusou o .html.\n\n' +
+                              'Para que fiquem na subpasta: Tampermonkey → Configurações →\n' +
+                              'Downloads → "Extensões de arquivo na lista branca" e inclua: html');
+                    }
                     if (fails.length) {
                         log('falharam ' + fails.length + ' arquivo(s): ' +
                             fails.map(function (f) { return f.name; }).join(' | '));
@@ -295,8 +309,6 @@
             noReply = setTimeout(onNoReply, 30000);
             btn.textContent = 'Baixando 0/' + items.length + '...';
             btn.style.background = '#78350f';
-            // A pasta é recalculada a cada envio (inclusive na repetição das
-            // falhas) e viaja separada dos nomes — quem prefixa é o host.
             (window.top || window).postMessage(
                 { __tceReq: 1, batchId: batchId, folder: getProcessFolder() || '', items: items }, '*');
         }
@@ -318,19 +330,15 @@
             downloading = true;
             pauseBackground();
 
-            // FIX 2: guarda o estado REAL de cada dropdown (inclusive os que o
-            // usuário abriu manualmente) para restaurar exatamente como estava.
             var expanded = [];
             document.querySelectorAll('span[id^="subMostra"]').forEach(function (s) {
-                expanded.push({ el: s, prev: s.style.display }); // salva TODOS, aberto ou fechado
+                expanded.push({ el: s, prev: s.style.display });
                 s.style.display = 'block';
             });
             function restore() {
                 for (var i = 0; i < expanded.length; i++) {
                     try { expanded[i].el.style.display = expanded[i].prev; } catch (e) {}
                 }
-                // FIX 2b/3: logo após recolher, reaplica as máscaras para os
-                // eventos nunca ficarem "sem número" durante/depois da coleta.
                 try { showEventNumbers(); enforceMaskVisibility(); } catch (e) {}
             }
 
@@ -342,16 +350,20 @@
                     alert('Nenhum arquivo encontrado.');
                     return;
                 }
+                var nPdf = items.filter(function (i) { return i.kind === 'direct'; }).length;
+                var nExt = items.length - nPdf;
                 var folder = getProcessFolder();
                 var msg = 'Baixar ' + items.length + ' arquivo(s)?\n' +
-                          '(Arquivos .html e .lnk são ignorados)\n\n' +
+                          '  • ' + nPdf + ' PDF(s)\n' +
+                          '  • ' + nExt + ' documento(s) com conteúdo extraído\n' +
+                          '    (despachos .html e publicações .lnk → salvos como .html)\n\n' +
                           (folder
                               ? 'Pasta de destino (dentro de Downloads):\n    ' + folder
                               : 'Número do processo não encontrado — os arquivos vão\n' +
                                 'direto para a raiz da pasta Downloads.');
                 if (!confirm(msg)) {
                     downloading = false; resumeBackground();
-                    run(); // reaplica máscaras após o cancelamento
+                    run();
                     return;
                 }
                 btn.dataset.busy = '1';
@@ -362,9 +374,6 @@
         // ── EXECUÇÃO IDEMPOTENTE ──
         function run() {
             try {
-                // FIX 3: mesmo durante o download, mantém as máscaras aplicadas e
-                // visíveis (só evita mexer nos dropdowns). Antes o "return" deixava
-                // os eventos sem número por todo o lote.
                 var addedMasks = showEventNumbers();
                 enforceMaskVisibility();
                 if (downloading) return;
@@ -427,31 +436,221 @@
     }
     function scan() { scanWin(W, 0); }
 
+    // ════════════════════════════════════════════════════════════════════
+    // EXTRAÇÃO DE CONTEÚDO (v1.7)
+    // Os despachos "online.html" vêm em ISO-8859-1 com imagens relativas, e os
+    // ".lnk" ("Disponibilização DOE") são só um redirecionamento para o Diário
+    // Oficial (do.tce.sp.gov.br). Aqui buscamos o documento final com
+    // GM_xmlhttpRequest (que segue o redirecionamento e passa por CORS),
+    // decodificamos no charset certo, embutimos CSS e imagens e salvamos um
+    // .html autossuficiente em UTF-8, que abre offline.
+    // ════════════════════════════════════════════════════════════════════
+    function gmGet(url, timeout) {
+        return new Promise(function (resolve, reject) {
+            try {
+                GM_xmlhttpRequest({
+                    method: 'GET',
+                    url: url,
+                    responseType: 'arraybuffer',
+                    timeout: timeout || DL_TIMEOUT,
+                    onload: function (r) {
+                        if (r.status >= 500) return reject('server_error');
+                        if (r.status >= 400 || r.status === 0) return reject('http_' + r.status);
+                        resolve(r);
+                    },
+                    onerror: function () { reject('network'); },
+                    ontimeout: function () { reject('timeout'); },
+                    onabort: function () { reject('network'); }
+                });
+            } catch (e) { reject('fatal'); }
+        });
+    }
+
+    function headerValue(r, name) {
+        var re = new RegExp('^' + name + ':\\s*(.*)$', 'im');
+        var m = re.exec(r.responseHeaders || '');
+        return m ? m[1].trim() : '';
+    }
+
+    function normCharset(c) {
+        c = (c || '').toLowerCase().replace(/["']/g, '').trim();
+        if (!c || c === 'iso-8859-1' || c === 'latin1' || c === 'latin-1' || c === 'us-ascii' || c === 'ascii') return 'windows-1252';
+        return c;
+    }
+
+    function latinHead(buf, n) {
+        return new TextDecoder('windows-1252').decode(new Uint8Array(buf).subarray(0, n));
+    }
+
+    function decodeText(buf, ct) {
+        var cs;
+        var m = /charset=([^;\s]+)/i.exec(ct || '');
+        if (m) cs = normCharset(m[1]);
+        else {
+            m = /<meta[^>]+charset=["']?([\w-]+)/i.exec(latinHead(buf, 4096));
+            cs = m ? normCharset(m[1]) : 'windows-1252';
+        }
+        try { return new TextDecoder(cs).decode(buf); }
+        catch (e) { return new TextDecoder('windows-1252').decode(buf); }
+    }
+
+    function looksHtml(ct, buf) {
+        if (/html/i.test(ct)) return true;
+        if (ct && !/text\/plain|octet-stream|x-download|force-download/i.test(ct)) return false;
+        return /<!doctype html|<html|<body|<table|<div|<p[\s>]/i.test(latinHead(buf, 2048));
+    }
+
+    function toBase64(buf) {
+        var b = new Uint8Array(buf), s = '', CH = 0x8000;
+        for (var i = 0; i < b.length; i += CH) s += String.fromCharCode.apply(null, b.subarray(i, i + CH));
+        return btoa(s);
+    }
+
+    function absUrl(u, base) {
+        try { return new URL(u, base).href; } catch (e) { return u; }
+    }
+
+    function absolutizeCss(css, base) {
+        return css.replace(/url\(\s*(['"]?)([^'")]+)\1\s*\)/g, function (all, q, u) {
+            if (/^(data:|#)/i.test(u)) return all;
+            return 'url("' + absUrl(u, base) + '")';
+        });
+    }
+
+    function makeExtractor() {
+        var imgCache = {};
+        function imgToData(url) {
+            if (!imgCache[url]) {
+                imgCache[url] = gmGet(url, 30000).then(function (r) {
+                    var ct = (headerValue(r, 'content-type').split(';')[0] || 'image/png').trim();
+                    return 'data:' + ct + ';base64,' + toBase64(r.response);
+                }, function () { return url; });
+            }
+            return imgCache[url];
+        }
+
+        async function buildHtml(html, baseUrl) {
+            var doc = new DOMParser().parseFromString(html, 'text/html');
+            var rm = function (sel) {
+                Array.prototype.slice.call(doc.querySelectorAll(sel)).forEach(function (n) { n.remove(); });
+            };
+            rm('script, noscript, base, meta[http-equiv], meta[charset], iframe[src*="DownloadArquivo"]');
+
+            var head = doc.head;
+            if (!head) { head = doc.createElement('head'); doc.documentElement.insertBefore(head, doc.body); }
+            var meta = doc.createElement('meta');
+            meta.setAttribute('charset', 'utf-8');
+            head.insertBefore(meta, head.firstChild);
+
+            // CSS externo → <style> embutido
+            var links = Array.prototype.slice.call(doc.querySelectorAll('link[rel~="stylesheet"][href]'));
+            for (var i = 0; i < links.length; i++) {
+                var href = absUrl(links[i].getAttribute('href'), baseUrl);
+                try {
+                    var r = await gmGet(href, 30000);
+                    var st = doc.createElement('style');
+                    st.textContent = absolutizeCss(decodeText(r.response, headerValue(r, 'content-type')), href);
+                    links[i].replaceWith(st);
+                } catch (e) { links[i].setAttribute('href', href); }
+            }
+
+            // imagens → data URI (abre offline)
+            var imgs = Array.prototype.slice.call(doc.querySelectorAll('img[src]'));
+            for (var j = 0; j < imgs.length; j++) {
+                var src = imgs[j].getAttribute('src') || '';
+                if (/^data:/i.test(src)) continue;
+                imgs[j].setAttribute('src', await imgToData(absUrl(src, baseUrl)));
+            }
+
+            // links → absolutos; remove handlers inline
+            Array.prototype.slice.call(doc.querySelectorAll('*')).forEach(function (el) {
+                for (var k = el.attributes.length - 1; k >= 0; k--) {
+                    if (/^on/i.test(el.attributes[k].name)) el.removeAttribute(el.attributes[k].name);
+                }
+                if (el.tagName === 'A' && el.hasAttribute('href')) {
+                    var h = el.getAttribute('href');
+                    if (!/^(#|javascript:|mailto:)/i.test(h)) el.setAttribute('href', absUrl(h, baseUrl));
+                }
+            });
+
+            return '<!DOCTYPE html>\n<!-- Conteúdo extraído do e-TCESP em ' + new Date().toLocaleString('pt-BR') +
+                   ' | origem: ' + String(baseUrl).replace(/--/g, '- -') + ' -->\n' +
+                   doc.documentElement.outerHTML;
+        }
+
+        function htmlName(n) {
+            if (/\.html?$/i.test(n)) return n;
+            return n.replace(/\.(lnk|url|php|aspx?|jsp|do)$/i, '') + '.html';
+        }
+
+        return async function extract(item) {
+            var r = await gmGet(item.url);
+            var buf = r.response;
+            if (!buf || !buf.byteLength) throw 'vazio';
+            var ct = headerValue(r, 'content-type');
+            var finalUrl = r.finalUrl || item.url;
+            if (looksHtml(ct, buf)) {
+                var html = await buildHtml(decodeText(buf, ct), finalUrl);
+                return { blob: new Blob([html], { type: 'text/html;charset=utf-8' }), name: htmlName(item.name) };
+            }
+            // não é HTML (ex.: .doc, .xls, .zip): salva os bytes reais
+            return { blob: new Blob([buf], { type: (ct.split(';')[0] || 'application/octet-stream') }), name: item.name };
+        };
+    }
+
+    // Salva um Blob. Tenta GM_download (respeita a subpasta); se o Tampermonkey
+    // recusar (extensão fora da lista branca, blob não suportado...), cai para
+    // um <a download> comum, que salva na raiz de Downloads.
+    function saveBlob(blob, name, prefix, cb) {
+        var burl = URL.createObjectURL(blob);
+        var done = false;
+        function fin(how) {
+            if (done) return; done = true;
+            setTimeout(function () { try { URL.revokeObjectURL(burl); } catch (e) {} }, 120000);
+            cb(how);
+        }
+        function fallback() {
+            try {
+                var a = document.createElement('a');
+                a.href = burl;
+                a.download = name;
+                a.style.display = 'none';
+                (document.body || document.documentElement).appendChild(a);
+                a.click();
+                a.remove();
+                fin('fallback');
+            } catch (e) { fin('erro'); }
+        }
+        try {
+            GM_download({
+                url: burl,
+                name: prefix + name,
+                saveAs: false,
+                onload: function () { fin('ok'); },
+                onerror: function () { fallback(); },
+                ontimeout: function () { fallback(); }
+            });
+        } catch (e) { fallback(); }
+    }
+
     // ── HOST DE DOWNLOAD ──
     var DL_TIMEOUT = 120000;
     var CONFIG_ERRORS = { not_enabled: 1, not_whitelisted: 1, not_permitted: 1, not_supported: 1 };
     var TRANSIENT = { timeout: 1, network: 1, server_error: 1 };
 
-    /* Estratégia de ritmo: dispara TODOS os arquivos de uma vez e deixa o
-       navegador/servidor ditarem o limite real. Só quando aparece falha de rede
-       (timeout, conexão caída, 5xx) o lote entra em modo limitado — poucos
-       downloads simultâneos e intervalo entre disparos —, apertando mais a cada
-       nova falha. O modo limitado não volta atrás: uma vez que o servidor deu
-       sinal de saturação, o resto do lote termina no ritmo seguro. */
     var CONCORRENCIA_LIMITADA = 3;
     var GAP_LIMITADO_MS = 200;
     var GAP_LIMITADO_MAX_MS = 3000;
 
     function runDownloadBatch(items, source, batchId, folder) {
-        /* Prefixo da subpasta aplicado só na hora do GM_download: assim item.name
-           continua sendo o nome puro do arquivo no progresso, nas falhas devolvidas
-           à página e na repetição do lote (que reenvia a pasta por conta própria). */
         var prefix = folder ? folder + '/' : '';
-        var pending = items.map(function (it) { return { url: it.url, name: it.name, tries: 0 }; });
+        var extract = makeExtractor();
+        var pending = items.map(function (it) { return { url: it.url, name: it.name, kind: it.kind, tries: 0 }; });
         var total = pending.length;
         var done = 0, inFlight = 0;
         var failures = [];
-        var concurrency = total;            /* tudo de uma vez */
+        var fallbacks = [];
+        var concurrency = total;
         var launchGap = 0, lastLaunch = 0;
         var limitado = false;
         var finished = false;
@@ -488,16 +687,36 @@
             } else {
                 done++;
                 if (TRANSIENT[kind]) limitar(kind);
-                failures.push({ url: item.url, name: item.name });
+                try { console.log('[E-TCESP] falhou (' + kind + '): ' + item.name); } catch (e) {}
+                failures.push({ url: item.url, name: item.name, kind: item.kind });
             }
             reportarProgresso();
             pump();
         }
-        function launch(item) {
+
+        // Despachos, .lnk e demais não-PDF: busca o conteúdo e salva o documento.
+        function launchExtract(item) {
             inFlight++;
-            /* Com muitos downloads disparados juntos, o navegador enfileira: o
-               arquivo pode ficar minutos só esperando a vez. O prazo acompanha a
-               fila para não marcar como "timeout" quem nem começou a baixar. */
+            var settled = false;
+            function fin(ok, kind) {
+                if (settled) return; settled = true;
+                clearTimeout(watchdog);
+                settle(item, ok, kind);
+            }
+            var watchdog = setTimeout(function () { fin(false, 'timeout'); }, DL_TIMEOUT * 2);
+            extract(item).then(function (res) {
+                saveBlob(res.blob, res.name, prefix, function (how) {
+                    if (how === 'fallback') fallbacks.push(res.name);
+                    fin(how !== 'erro', how === 'erro' ? 'fatal' : undefined);
+                });
+            }, function (err) {
+                fin(false, typeof err === 'string' ? err : 'fatal');
+            });
+        }
+
+        function launch(item) {
+            if (item.kind === 'extract') return launchExtract(item);
+            inFlight++;
             var prazo = DL_TIMEOUT + Math.min(600000, inFlight * 2000);
             var settled = false, handle;
             function fin(ok, kind) {
@@ -531,7 +750,7 @@
             if (finished) return;
             if (done >= total && inFlight === 0 && pending.length === 0) {
                 finished = true;
-                reply({ type: 'done', total: total, failures: failures });
+                reply({ type: 'done', total: total, failures: failures, fallbacks: fallbacks });
                 return;
             }
             while (inFlight < concurrency && pending.length) {
@@ -553,20 +772,19 @@
         if (ev.origin !== location.origin) return;
         var d = ev.data;
         if (!d || d.__tceReq !== 1 || !d.batchId || !Array.isArray(d.items) || !d.items.length) return;
-        if (typeof GM_download !== 'function') {
+        if (typeof GM_download !== 'function' || typeof GM_xmlhttpRequest !== 'function') {
             try { ev.source.postMessage({ __tce: 1, batchId: d.batchId, type: 'config' }, '*'); } catch (e) {}
             return;
         }
-        // Só aceita pasta no formato do número do processo (dígitos, ponto e
-        // hífen, começando por dígito): nada de barra, logo nada de sair da
-        // pasta de Downloads. Qualquer outra coisa cai na raiz.
         var folder = (typeof d.folder === 'string' && /^\d[\d.\-]{0,59}$/.test(d.folder)) ? d.folder : '';
         var items = [];
         for (var i = 0; i < d.items.length; i++) {
             var it = d.items[i];
             if (!it || typeof it.url !== 'string' || typeof it.name !== 'string') continue;
             if (it.url.indexOf(location.origin + '/') !== 0) continue;
-            items.push({ url: it.url, name: it.name });
+            // o nome vem da página: barra/ponto-ponto nunca entram no caminho
+            var name = it.name.replace(/[\\/]+/g, '-').replace(/^\.+/, '') || 'arquivo';
+            items.push({ url: it.url, name: name, kind: it.kind === 'direct' ? 'direct' : 'extract' });
         }
         if (items.length) runDownloadBatch(items, ev.source, d.batchId, folder);
     }
